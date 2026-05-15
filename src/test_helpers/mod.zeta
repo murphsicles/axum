@@ -1,0 +1,21 @@
+// Auto-converted from /tmp/df-axum-0.8.9/axum-0.8.9/src/test_helpers/mod.rs
+
+use crate::{ extract::Request, response::Response, serve };
+mod test_client;
+pub use self::test_client::*;
+#[cfg(test)]
+mod tracing_helpers;
+#[cfg(test)]
+mod counting_cloneable_state;
+#[cfg(test)]
+fn assert_send<T: Send>() {
+}
+
+#[cfg(test)]
+fn assert_sync<T: Sync>() {
+}
+
+struct NotSendSync {
+ (*const()),
+}
+

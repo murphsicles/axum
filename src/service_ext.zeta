@@ -1,0 +1,24 @@
+// Auto-converted from /tmp/df-axum-0.8.9/axum-0.8.9/src/service_ext.rs
+
+use crate::error_handling::HandleError;
+#[cfg(feature = "tokio")] use crate::extract::connect_info::IntoMakeServiceWithConnectInfo;
+use crate::routing::IntoMakeService;
+use tower_service::Service;
+/// Extension trait that adds additional methods to any [`Service`].
+pub trait ServiceExt<R> {
+ fn into_make_service(self) -> IntoMakeService<Self>;
+ fn into_make_service_with_connect_info<C>(self) -> IntoMakeServiceWithConnectInfo<Self, C>;
+ fn handle_error<F, T>(self, f: F) -> HandleError<Self, F, T>
+}
+
+impl<S, R> ServiceExt<R> for S where S: Service<R> + Sized {
+ fn into_make_service(self) -> IntoMakeService<Self> {
+ IntoMakeService::new(self)
+ }
+ 
+ fn into_make_service_with_connect_info(self) -> IntoMakeServiceWithConnectInfo<Self, C> {
+ IntoMakeServiceWithConnectInfo::new(self)
+ }
+ 
+}
+

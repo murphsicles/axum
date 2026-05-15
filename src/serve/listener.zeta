@@ -1,0 +1,87 @@
+// Auto-converted from /tmp/df-axum-0.8.9/axum-0.8.9/src/serve/listener.rs
+
+use std::{ fmt, future::Future, time::Duration };
+use tokio::{ io::{ self, AsyncRead, AsyncWrite }, net::{ TcpListener, TcpStream } };
+/// Types that can listen for connections.
+pub trait Listener {
+ type Io;
+ type Addr;
+ fn accept(&mut self) -> impl Future<_> + Send;
+ fn local_addr(&self) -> io::Result<Self::Addr>
+}
+
+impl Listener for TcpListener {
+ type Io = TcpStream;
+ type Addr = std::net::SocketAddr;
+ fn accept(&mut self) ->(Self::Io, Self::Addr) {
+ loop { match Self::accept(self).await { Ok(tup) => return tup, Err(e) => handle_accept_error(e).await } }
+ }
+ 
+ fn local_addr(&self) -> io::Result<Self::Addr> {
+ Self::local_addr(self)
+ }
+ 
+}
+
+#[cfg(unix)]
+impl Listener for tokio::net::UnixListener {
+ type Io = tokio::net::UnixStream;
+ type Addr = tokio::net::unix::SocketAddr;
+ fn accept(&mut self) ->(Self::Io, Self::Addr) {
+ loop { match Self::accept(self).await { Ok(tup) => return tup, Err(e) => handle_accept_error(e).await } }
+ }
+ 
+ fn local_addr(&self) -> io::Result<Self::Addr> {
+ Self::local_addr(self)
+ }
+ 
+}
+
+/// Extensions to [`Listener`].
+pub trait ListenerExt {
+ fn tap_io<F>(self, tap_fn: F) -> TapIo<Self, F> where F: FnMut + Send + static
+}
+
+impl<L: Listener> ListenerExt for L {
+}
+
+/// Return type of [`ListenerExt::tap_io`].
+/// 
+/// See that method for details.
+pub struct TapIo<L, F> {
+ listener: L,
+ tap_fn: F,
+}
+
+impl<L, F> fmt::Debug for TapIo<L, F> where L: Listener + fmt::Debug {
+ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+ f.debug_struct("TapIo").field("listener", &self.listener).finish_non_exhaustive()
+ }
+ 
+}
+
+impl<L, F> Listener for TapIo<L, F> where L: Listener, F: FnMut + Send + static {
+ type Io = L::Io;
+ type Addr = L::Addr;
+ fn accept(&mut self) ->(Self::Io, Self::Addr) {
+ let _ = self.listener.accept().await;
+ (self.tap_fn)(&mut io);
+ (io, addr)
+ }
+ 
+ fn local_addr(&self) -> io::Result<Self::Addr> {
+ self.listener.local_addr()
+ }
+ 
+}
+
+fn handle_accept_error(e: io::Error) {
+ if is_connection_error(&e) { return; }
+ error!("accept error: {e}");
+ tokio::time::sleep(Duration::from_secs(1)).await
+}
+
+fn is_connection_error(e: &io::Error) -> bool {
+ matches!(e.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset)
+}
+

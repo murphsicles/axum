@@ -1,0 +1,139 @@
+// Auto-converted from /tmp/df-axum-0.8.9/axum-0.8.9/src/routing/route.rs
+
+use crate::{ body::{ Body, HttpBody }, response::Response, util::MapIntoResponse };
+use axum_core::{ extract::Request, response::IntoResponse };
+use bytes::Bytes;
+use http::{ header::{ self, CONTENT_LENGTH }, HeaderMap, HeaderValue, Method };
+use pin_project_lite::pin_project;
+use std::{ convert::Infallible, fmt, future::Future, pin::Pin, task::{ ready, Context, Poll } };
+use tower::{ util::{ BoxCloneSyncService, MapErrLayer, Oneshot }, ServiceExt };
+use tower_layer::Layer;
+use tower_service::Service;
+/// How routes are stored inside a [`Router`](super::Router).
+/// 
+/// You normally shouldn't need to care about this type. It's used in
+/// [`Router::layer`](super::Router::layer).
+pub struct Route<E> {
+ (BoxCloneSyncService<Request, Response, E>),
+}
+
+impl<E> Route<E> {
+ fn new(svc: T) -> Self {
+ Self(BoxCloneSyncService::new(MapIntoResponse::new(svc)))
+ }
+ 
+ fn call_owned(self, req: Request<Body>) -> RouteFuture<E> {
+ let req = req.map(Body::new);
+ self.oneshot_inner_owned(req).not_top_level()
+ }
+ 
+ fn oneshot_inner(&mut self, req: Request) -> RouteFuture<E> {
+ let method = req.method().clone();
+ RouteFuture::new(method, self.0.clone().oneshot(req))
+ }
+ 
+ fn oneshot_inner_owned(self, req: Request) -> RouteFuture<E> {
+ let method = req.method().clone();
+ RouteFuture::new(method, self.0.oneshot(req))
+ }
+ 
+ fn layer(self, layer: L) -> Route<NewError> {
+ let layer = (MapErrLayer::new(Into::into), layer);
+ Route::new(layer.layer(self))
+ }
+ 
+}
+
+impl<E> Clone for Route<E> {
+ fn clone(&self) -> Self {
+ Self(self.0.clone())
+ }
+ 
+}
+
+impl<E> fmt::Debug for Route<E> {
+ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+ f.debug_struct("Route").finish()
+ }
+ 
+}
+
+impl<B, E> Service<Request<B>> for Route<E> where B: HttpBody<_> + Send + static, B::Error: Into<axum_core::BoxError> {
+ type Response = Response;
+ type Error = E;
+ type Future = RouteFuture<E>;
+ fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+ Poll::Ready(Ok(()))
+ }
+ 
+ fn call(&mut self, req: Request<B>) -> Self::Future {
+ self.oneshot_inner(req.map(Body::new)).not_top_level()
+ }
+ 
+}
+
+pin_project ! { #[doc = " Response future for [`Route`]."] pub struct RouteFuture<E> { #[pin] inner: Oneshot < BoxCloneSyncService<Request, Response, E>, Request>, method: Method, allow_header: Option<Bytes>, top_level: bool } }
+impl<E> RouteFuture<E> {
+ fn new(method: Method, inner: Oneshot<BoxCloneSyncService<Request, Response, E>, Request>) -> Self {
+ Self { inner, method, allow_header: None, top_level: true }
+ }
+ 
+ fn allow_header(self, allow_header: Bytes) -> Self {
+ self.allow_header = Some(allow_header);
+ self
+ }
+ 
+ fn not_top_level(self) -> Self {
+ self.top_level = false;
+ self
+ }
+ 
+}
+
+impl<E> Future for RouteFuture<E> {
+ type Output = Result<Response, E>;
+ fn poll(self, cx: &mut Context<'_>) -> Poll<Self::Output> {
+ let this = self.project();
+ let mut res = ready!(this.inner.poll(cx)) ?;
+ if * this.method == Method::CONNECT &&res.status().is_success() { if res.headers().contains_key(&CONTENT_LENGTH) || res.headers().contains_key(&header::TRANSFER_ENCODING) || res.size_hint().lower() != 0 { error!("response to CONNECT with nonempty body"); res = res.map(| _ | Body::empty()); } } else if * this.top_level { set_allow_header(res.headers_mut(), this.allow_header); set_content_length(res.size_hint(), res.headers_mut()); if * this.method == Method::HEAD { *res.body_mut() = Body::empty(); } }
+ Poll::Ready(Ok(res))
+ }
+ 
+}
+
+fn set_allow_header(headers: &mut HeaderMap, allow_header: &mut Option<Bytes>) {
+ match allow_header.take() { Some(allow_header) if ! headers.contains_key(header::ALLOW) => { headers.insert(header::ALLOW, HeaderValue::from_maybe_shared(allow_header).expect("invalid `Allow` header") ); } _ => { } }
+}
+
+fn set_content_length(size_hint: http_body::SizeHint, headers: &mut HeaderMap) {
+ if headers.contains_key(CONTENT_LENGTH) { return; }
+ if let Some(size) = size_hint.exact() { let header_value = if size == 0 { #[allow(clippy::declare_interior_mutable_const)] const ZERO: HeaderValue = HeaderValue::from_static("0"); ZERO } else { let mut buffer = itoa::Buffer::new(); HeaderValue::from_str(buffer.format(size)).unwrap() }; headers.insert(CONTENT_LENGTH, header_value); }
+}
+
+pin_project ! { #[doc = " A [`RouteFuture`] that always yields a [`Response`]."] pub struct InfallibleRouteFuture { #[pin] future: RouteFuture<Infallible> } }
+impl InfallibleRouteFuture {
+ fn new(future: RouteFuture<Infallible>) -> Self {
+ Self { future }
+ }
+ 
+}
+
+impl Future for InfallibleRouteFuture {
+ type Output = Response;
+ fn poll(self, cx: &mut Context<'_>) -> Poll<Self::Output> {
+ match ready!(self.project().future.poll(cx)) { Ok(response) => Poll::Ready(response), Err(err) => match err { } }
+ }
+ 
+}
+
+#[cfg(test)]
+mod tests {
+ use super::*;
+ #[test]
+ fn traits() {
+ use crate::test_helpers::*;
+ assert_send::<Route<()> >();
+ }
+ 
+}
+

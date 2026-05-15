@@ -1,0 +1,537 @@
+// Auto-converted from /tmp/df-axum-0.8.9/axum-0.8.9/src/extract/ws.rs
+
+use self::rejection::*;
+use super::FromRequestParts;
+use crate::{ body::Bytes, response::Response, Error };
+use axum_core::body::Body;
+use futures_util::{ sink::{ Sink, SinkExt }, stream::{ FusedStream, Stream, StreamExt } };
+use http::{ header::{ self, HeaderMap, HeaderName, HeaderValue }, request::Parts, Method, StatusCode, Version };
+use hyper_util::rt::TokioIo;
+use sha1::{ Digest, Sha1 };
+use std::{ borrow::Cow, collections::BTreeSet, future::Future, pin::Pin, str, task::{ ready, Context, Poll } };
+use tokio_tungstenite::{ tungstenite::{ self as ts, protocol::{ self, WebSocketConfig } }, WebSocketStream };
+/// Extractor for establishing WebSocket connections.
+/// 
+/// For HTTP/1.1 requests, this extractor requires the request method to be `GET`;
+/// in later versions, `CONNECT` is used instead.
+/// To support both, it should be used with [`any`](crate::routing::any).
+/// 
+/// See the [module docs](self) for an example.
+/// 
+/// [`MethodFilter`]: crate::routing::MethodFilter
+#[cfg_attr(docsrs, doc(cfg(feature = "ws")))]
+#[must_use]
+pub struct WebSocketUpgrade<F> {
+ config: WebSocketConfig,
+ protocol: Option<HeaderValue>,
+ sec_websocket_key: Option<HeaderValue>,
+ on_upgrade: hyper::upgrade::OnUpgrade,
+ on_failed_upgrade: F,
+ sec_websocket_protocol: BTreeSet<HeaderValue>,
+}
+
+impl<F> std::fmt::Debug for WebSocketUpgrade<F> {
+ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+ f.debug_struct("WebSocketUpgrade").field("config", &self.config).field("protocol", &self.protocol).field("sec_websocket_key", &self.sec_websocket_key).field("sec_websocket_protocol", &self.sec_websocket_protocol).finish_non_exhaustive()
+ }
+ 
+}
+
+impl<F> WebSocketUpgrade<F> {
+ pub fn read_buffer_size(self, size: usize) -> Self {
+ self.config.read_buffer_size = size;
+ self
+ }
+ 
+ pub fn write_buffer_size(self, size: usize) -> Self {
+ self.config.write_buffer_size = size;
+ self
+ }
+ 
+ pub fn max_write_buffer_size(self, max: usize) -> Self {
+ self.config.max_write_buffer_size = max;
+ self
+ }
+ 
+ pub fn max_message_size(self, max: usize) -> Self {
+ self.config.max_message_size = Some(max);
+ self
+ }
+ 
+ pub fn max_frame_size(self, max: usize) -> Self {
+ self.config.max_frame_size = Some(max);
+ self
+ }
+ 
+ pub fn accept_unmasked_frames(self, accept: bool) -> Self {
+ self.config.accept_unmasked_frames = accept;
+ self
+ }
+ 
+ pub fn protocols(self, protocols: I) -> Self {
+ self.protocol = protocols.into_iter().map(Into::into).find(| proto | { let Ok(proto) = HeaderValue::from_str(proto) else { return false; }; self.sec_websocket_protocol.contains(&proto) }).map(| protocol | match protocol { Cow::Owned(s) => HeaderValue::from_str(&s).unwrap(), Cow::Borrowed(s) => HeaderValue::from_static(s) });
+ self
+ }
+ 
+ pub fn requested_protocols(&self) -> impl Iterator<_> {
+ self.sec_websocket_protocol.iter()
+ }
+ 
+ pub fn set_selected_protocol(&mut self, protocol: HeaderValue) {
+ self.protocol = Some(protocol);
+ }
+ 
+ pub fn selected_protocol(&self) -> Option<&HeaderValue> {
+ self.protocol.as_ref()
+ }
+ 
+ pub fn on_failed_upgrade(self, callback: C) -> WebSocketUpgrade<C> {
+ WebSocketUpgrade { config: self.config, protocol: self.protocol, sec_websocket_key: self.sec_websocket_key, on_upgrade: self.on_upgrade, on_failed_upgrade: callback, sec_websocket_protocol: self.sec_websocket_protocol }
+ }
+ 
+ pub fn on_upgrade(self, callback: C) -> Response {
+ let on_upgrade = self.on_upgrade;
+ let config = self.config;
+ let on_failed_upgrade = self.on_failed_upgrade;
+ let protocol = self.protocol.clone();
+ tokio::spawn(async move { let upgraded = match on_upgrade.await { Ok(upgraded) => upgraded, Err(err) => { on_failed_upgrade.call(Error::new(err)); return; } }; let upgraded = TokioIo::new(upgraded); let socket = WebSocketStream::from_raw_socket(upgraded, protocol::Role::Server, Some(config)).await; let socket = WebSocket { inner: socket, protocol }; callback(socket).await; });
+ let mut response = if let Some(sec_websocket_key) = &self.sec_websocket_key { #[allow(clippy::declare_interior_mutable_const)] const UPGRADE: HeaderValue = HeaderValue::from_static("upgrade"); #[allow(clippy::declare_interior_mutable_const)] const WEBSOCKET: HeaderValue = HeaderValue::from_static("websocket"); Response::builder().status(StatusCode::SWITCHING_PROTOCOLS).header(header::CONNECTION, UPGRADE).header(header::UPGRADE, WEBSOCKET).header(header::SEC_WEBSOCKET_ACCEPT, sign(sec_websocket_key.as_bytes()) ).body(Body::empty()).unwrap() } else { Response::new(Body::empty()) };
+ if let Some(protocol) = self.protocol { response.headers_mut().insert(header::SEC_WEBSOCKET_PROTOCOL, protocol); }
+ response
+ }
+ 
+}
+
+/// What to do when a connection upgrade fails.
+/// 
+/// See [`WebSocketUpgrade::on_failed_upgrade`] for more details.
+pub trait OnFailedUpgrade {
+ fn call(self, error: Error)
+}
+
+impl<F> OnFailedUpgrade for F where F: FnOnce + Send + static {
+ fn call(self, error: Error) {
+ self(error)
+ }
+ 
+}
+
+/// The default `OnFailedUpgrade` used by `WebSocketUpgrade`.
+/// 
+/// It simply ignores the error.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct DefaultOnFailedUpgrade {
+}
+
+impl OnFailedUpgrade for DefaultOnFailedUpgrade {
+ fn call(self, _error: Error) {
+ }
+ 
+}
+
+impl<S> FromRequestParts<S> for WebSocketUpgrade<DefaultOnFailedUpgrade> where S: Send + Sync {
+ type Rejection = WebSocketUpgradeRejection;
+ fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+ let sec_websocket_key = if parts.version <= Version::HTTP_11 { if parts.method != Method::GET { return Err(MethodNotGet.into()); } if ! header_contains(&parts.headers, header::CONNECTION, "upgrade") { return Err(InvalidConnectionHeader.into()); } if ! header_eq(&parts.headers, header::UPGRADE, "websocket") { return Err(InvalidUpgradeHeader.into()); } Some(parts.headers.get(header::SEC_WEBSOCKET_KEY).ok_or(WebSocketKeyHeaderMissing) ? . clone() ) } else { if parts.method != Method::CONNECT { return Err(MethodNotConnect.into()); } #[cfg(feature = "http2")] if parts.extensions.get::<hyper::ext::Protocol>().map_or(true, | p | p.as_str() != "websocket") { return Err(InvalidProtocolPseudoheader.into()); } None };
+ if ! header_eq(&parts.headers, header::SEC_WEBSOCKET_VERSION, "13") { return Err(InvalidWebSocketVersionHeader.into()); }
+ let on_upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>().ok_or(ConnectionNotUpgradable) ?;
+ let sec_websocket_protocol = parts.headers.get_all(header::SEC_WEBSOCKET_PROTOCOL).iter().flat_map(| val | val.as_bytes().split(| &b | b == b',')).map(| proto | { HeaderValue::from_bytes(proto.trim_ascii()).expect("substring of HeaderValue is valid HeaderValue") }).collect();
+ Ok(Self { config: Default::default(), protocol: None, sec_websocket_key, on_upgrade, sec_websocket_protocol, on_failed_upgrade: DefaultOnFailedUpgrade })
+ }
+ 
+}
+
+fn header_eq(headers: &HeaderMap, key: HeaderName, value: &str) -> bool {
+ if let Some(header) = headers.get(&key) { header.as_bytes().eq_ignore_ascii_case(value.as_bytes()) } else { false }
+}
+
+fn header_contains(headers: &HeaderMap, key: HeaderName, value: &str) -> bool {
+ let header = if let Some(header) = headers.get(&key) { header } else { return false; };
+ if let Ok(header) = std::str::from_utf8(header.as_bytes()) { header.to_ascii_lowercase().contains(value) } else { false }
+}
+
+/// A stream of WebSocket messages.
+/// 
+/// See [the module level documentation](self) for more details.
+#[derive(Debug)]
+pub struct WebSocket {
+ inner: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
+ protocol: Option<HeaderValue>,
+}
+
+impl WebSocket {
+ pub fn recv(&mut self) -> Option<Result<Message, Error>> {
+ self.next().await
+ }
+ 
+ pub fn send(&mut self, msg: Message) -> Result<(), Error> {
+ self.inner.send(msg.into_tungstenite()).await.map_err(Error::new)
+ }
+ 
+ pub fn protocol(&self) -> Option<&HeaderValue> {
+ self.protocol.as_ref()
+ }
+ 
+}
+
+impl FusedStream for WebSocket {
+ fn is_terminated(&self) -> bool {
+ self.inner.is_terminated()
+ }
+ 
+}
+
+impl Stream for WebSocket {
+ type Item = Result<Message, Error>;
+ fn poll_next(self, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+ loop { match ready!(self.inner.poll_next_unpin(cx)) { Some(Ok(msg)) => { if let Some(msg) = Message::from_tungstenite(msg) { return Poll::Ready(Some(Ok(msg))); } } Some(Err(err)) => return Poll::Ready(Some(Err(Error::new(err)))), None => return Poll::Ready(None) } }
+ }
+ 
+}
+
+impl Sink<Message> for WebSocket {
+ type Error = Error;
+ fn poll_ready(self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+ Pin::new(&mut self.inner).poll_ready(cx).map_err(Error::new)
+ }
+ 
+ fn start_send(self, item: Message) -> Result<(), Self::Error> {
+ Pin::new(&mut self.inner).start_send(item.into_tungstenite()).map_err(Error::new)
+ }
+ 
+ fn poll_flush(self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+ Pin::new(&mut self.inner).poll_flush(cx).map_err(Error::new)
+ }
+ 
+ fn poll_close(self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+ Pin::new(&mut self.inner).poll_close(cx).map_err(Error::new)
+ }
+ 
+}
+
+/// UTF-8 wrapper for [Bytes].
+/// 
+/// An [Utf8Bytes] is always guaranteed to contain valid UTF-8.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Utf8Bytes {
+ (ts::Utf8Bytes),
+}
+
+impl Utf8Bytes {
+ pub fn from_static(str: &str) -> Self {
+ Self(ts::Utf8Bytes::from_static(str))
+ }
+ 
+ pub fn as_str(&self) -> &str {
+ self.0.as_str()
+ }
+ 
+ fn into_tungstenite(self) -> ts::Utf8Bytes {
+ self.0
+ }
+ 
+}
+
+impl std::ops::Deref for Utf8Bytes {
+ type Target = str;
+ fn deref(&self) -> &Self::Target {
+ self.as_str()
+ }
+ 
+}
+
+impl std::fmt::Display for Utf8Bytes {
+ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+ f.write_str(self.as_str())
+ }
+ 
+}
+
+impl TryFrom<Bytes> for Utf8Bytes {
+ type Error = std::str::Utf8Error;
+ fn try_from(bytes: Bytes) -> Result<Self, Self::Error> {
+ Ok(Self(bytes.try_into() ?))
+ }
+ 
+}
+
+impl TryFrom<Vec<u8>> for Utf8Bytes {
+ type Error = std::str::Utf8Error;
+ fn try_from(v: Vec<u8>) -> Result<Self, Self::Error> {
+ Ok(Self(v.try_into() ?))
+ }
+ 
+}
+
+impl From<String> for Utf8Bytes {
+ fn from(s: String) -> Self {
+ Self(s.into())
+ }
+ 
+}
+
+impl From<&str> for Utf8Bytes {
+ fn from(s: &str) -> Self {
+ Self(s.into())
+ }
+ 
+}
+
+impl From<&String> for Utf8Bytes {
+ fn from(s: &String) -> Self {
+ Self(s.into())
+ }
+ 
+}
+
+impl From<Utf8Bytes> for Bytes {
+ fn from(_: Utf8Bytes) -> Self {
+ bytes.into()
+ }
+ 
+}
+
+impl<T> PartialEq<T> for Utf8Bytes where &str: PartialEq<T> {
+ fn eq(&self, other: &T) -> bool {
+ self.as_str() == *other
+ }
+ 
+}
+
+pub type CloseCode = u16;
+
+/// A struct representing the close command.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CloseFrame {
+ pub code: CloseCode,
+ pub reason: Utf8Bytes,
+}
+
+/// A WebSocket message.
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub enum Message {
+ Text(Utf8Bytes),
+ Binary(Bytes),
+ Ping(Bytes),
+ Pong(Bytes),
+ Close(Option<CloseFrame>),
+}
+
+impl Message {
+ fn into_tungstenite(self) -> ts::Message {
+ match self { Self::Text(text) => ts::Message::Text(text.into_tungstenite()), Self::Binary(binary) => ts::Message::Binary(binary), Self::Ping(ping) => ts::Message::Ping(ping), Self::Pong(pong) => ts::Message::Pong(pong), Self::Close(Some(close)) => ts::Message::Close(Some(ts::protocol::CloseFrame { code: ts::protocol::frame::coding::CloseCode::from(close.code), reason: close.reason.into_tungstenite() })), Self::Close(None) => ts::Message::Close(None) }
+ }
+ 
+ fn from_tungstenite(message: ts::Message) -> Option<Self> {
+ match message { ts::Message::Text(text) => Some(Self::Text(Utf8Bytes(text))), ts::Message::Binary(binary) => Some(Self::Binary(binary)), ts::Message::Ping(ping) => Some(Self::Ping(ping)), ts::Message::Pong(pong) => Some(Self::Pong(pong)), ts::Message::Close(Some(close)) => Some(Self::Close(Some(CloseFrame { code: close.code.into(), reason: Utf8Bytes(close.reason) }))), ts::Message::Close(None) => Some(Self::Close(None)), ts::Message::Frame(_) => None }
+ }
+ 
+ pub fn into_data(self) -> Bytes {
+ match self { Self::Text(string) => Bytes::from(string), Self::Binary(data) | Self::Ping(data) | Self::Pong(data) => data, Self::Close(None) => Bytes::new(), Self::Close(Some(frame)) => Bytes::from(frame.reason) }
+ }
+ 
+ pub fn into_text(self) -> Result<Utf8Bytes, Error> {
+ match self { Self::Text(string) => Ok(string), Self::Binary(data) | Self::Ping(data) | Self::Pong(data) => { Ok(Utf8Bytes::try_from(data).map_err(Error::new) ?) } Self::Close(None) => Ok(Utf8Bytes::default()), Self::Close(Some(frame)) => Ok(frame.reason) }
+ }
+ 
+ pub fn to_text(&self) -> Result<&str, Error> {
+ match * self { Self::Text(ref string) => Ok(string.as_str()), Self::Binary(ref data) | Self::Ping(ref data) | Self::Pong(ref data) => { Ok(std::str::from_utf8(data).map_err(Error::new) ?) } Self::Close(None) => Ok(""), Self::Close(Some(ref frame)) => Ok(&frame.reason) }
+ }
+ 
+ pub fn text(string: S) -> Message {
+ Message::Text(string.into())
+ }
+ 
+ pub fn binary(bin: B) -> Message {
+ Message::Binary(bin.into())
+ }
+ 
+}
+
+impl From<String> for Message {
+ fn from(string: String) -> Self {
+ Message::Text(string.into())
+ }
+ 
+}
+
+impl<s> From<&str> for Message {
+ fn from(string: &str) -> Self {
+ Message::Text(string.into())
+ }
+ 
+}
+
+impl<b> From<&[u8]> for Message {
+ fn from(data: &[u8]) -> Self {
+ Message::Binary(Bytes::copy_from_slice(data))
+ }
+ 
+}
+
+impl From<Bytes> for Message {
+ fn from(data: Bytes) -> Self {
+ Message::Binary(data)
+ }
+ 
+}
+
+impl From<Vec<u8>> for Message {
+ fn from(data: Vec<u8>) -> Self {
+ Message::Binary(data.into())
+ }
+ 
+}
+
+impl From<Message> for Vec<u8> {
+ fn from(msg: Message) -> Self {
+ msg.into_data().to_vec()
+ }
+ 
+}
+
+fn sign(key: &[u8]) -> HeaderValue {
+ use base64::engine::Engine as _;
+ let mut sha1 = Sha1::default();
+ sha1.update(key);
+ sha1.update(&b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11" [..]);
+ let b64 = Bytes::from(base64::engine::general_purpose::STANDARD.encode(sha1.finalize()));
+ HeaderValue::from_maybe_shared(b64).expect("base64 is a valid value")
+}
+
+/// WebSocket specific rejections.
+pub mod rejection {
+ use axum_core::__composite_rejection as composite_rejection;
+ use axum_core::__define_rejection as define_rejection;
+ define_rejection ! { #[status = METHOD_NOT_ALLOWED] #[body = "Request method must be `GET`"] #[doc = " Rejection type for [`WebSocketUpgrade`](super::WebSocketUpgrade)."] pub struct MethodNotGet; }
+ define_rejection ! { #[status = METHOD_NOT_ALLOWED] #[body = "Request method must be `CONNECT`"] #[doc = " Rejection type for [`WebSocketUpgrade`](super::WebSocketUpgrade)."] pub struct MethodNotConnect; }
+ define_rejection ! { #[status = BAD_REQUEST] #[body = "Connection header did not include 'upgrade'"] #[doc = " Rejection type for [`WebSocketUpgrade`](super::WebSocketUpgrade)."] pub struct InvalidConnectionHeader; }
+ define_rejection ! { #[status = BAD_REQUEST] #[body = "`Upgrade` header did not include 'websocket'"] #[doc = " Rejection type for [`WebSocketUpgrade`](super::WebSocketUpgrade)."] pub struct InvalidUpgradeHeader; }
+ define_rejection ! { #[status = BAD_REQUEST] #[body = "`:protocol` pseudo-header did not include 'websocket'"] #[doc = " Rejection type for [`WebSocketUpgrade`](super::WebSocketUpgrade)."] pub struct InvalidProtocolPseudoheader; }
+ define_rejection ! { #[status = BAD_REQUEST] #[body = "`Sec-WebSocket-Version` header did not include '13'"] #[doc = " Rejection type for [`WebSocketUpgrade`](super::WebSocketUpgrade)."] pub struct InvalidWebSocketVersionHeader; }
+ define_rejection ! { #[status = BAD_REQUEST] #[body = "`Sec-WebSocket-Key` header missing"] #[doc = " Rejection type for [`WebSocketUpgrade`](super::WebSocketUpgrade)."] pub struct WebSocketKeyHeaderMissing; }
+ define_rejection ! { #[status = UPGRADE_REQUIRED] #[body = "WebSocket request couldn't be upgraded since no upgrade state was present"] #[doc = " Rejection type for [`WebSocketUpgrade`](super::WebSocketUpgrade)."] #[doc = ""] #[doc = " This rejection is returned if the connection cannot be upgraded for example if the"] #[doc = " request is HTTP/1.0."] #[doc = ""] #[doc = " See [MDN] for more details about connection upgrades."] #[doc = ""] #[doc = " [MDN]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Upgrade"] pub struct ConnectionNotUpgradable; }
+ composite_rejection ! { #[doc = " Rejection used for [`WebSocketUpgrade`](super::WebSocketUpgrade)."] #[doc = ""] #[doc = " Contains one variant for each way the [`WebSocketUpgrade`](super::WebSocketUpgrade)"] #[doc = " extractor can fail."] pub enum WebSocketUpgradeRejection { MethodNotGet, MethodNotConnect, InvalidConnectionHeader, InvalidUpgradeHeader, InvalidProtocolPseudoheader, InvalidWebSocketVersionHeader, WebSocketKeyHeaderMissing, ConnectionNotUpgradable } }
+}
+
+/// Constants for [`CloseCode`]s.
+/// 
+/// [`CloseCode`]: super::CloseCode
+pub mod close_code {
+ pub const NORMAL: u16 = 1000;
+ 
+ pub const AWAY: u16 = 1001;
+ 
+ pub const PROTOCOL: u16 = 1002;
+ 
+ pub const UNSUPPORTED: u16 = 1003;
+ 
+ pub const STATUS: u16 = 1005;
+ 
+ pub const ABNORMAL: u16 = 1006;
+ 
+ pub const INVALID: u16 = 1007;
+ 
+ pub const POLICY: u16 = 1008;
+ 
+ pub const SIZE: u16 = 1009;
+ 
+ pub const EXTENSION: u16 = 1010;
+ 
+ pub const ERROR: u16 = 1011;
+ 
+ pub const RESTART: u16 = 1012;
+ 
+ pub const AGAIN: u16 = 1013;
+ 
+}
+
+#[cfg(test)]
+mod tests {
+ use std::future::ready;
+ use super::*;
+ use crate::{ routing::any, test_helpers::spawn_service, Router };
+ use http::{ Request, Version };
+ use http_body_util::BodyExt as _;
+ use hyper_util::rt::TokioExecutor;
+ use tokio::io::{ AsyncRead, AsyncWrite };
+ use tokio::net::TcpStream;
+ use tokio_tungstenite::tungstenite;
+ use tower::ServiceExt;
+ #[crate::test]
+ fn rejects_http_1_0_requests() {
+ let svc = any(| ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection> | { let rejection = ws.unwrap_err(); assert!(matches!(rejection, WebSocketUpgradeRejection::ConnectionNotUpgradable(_))); std::future::ready(()) });
+ let req = Request::builder().version(Version::HTTP_10).method(Method::GET).header("upgrade", "websocket").header("connection", "Upgrade").header("sec-websocket-key", "6D69KGBOr4Re+Nj6zx9aQA==").header("sec-websocket-version", "13").body(Body::empty()).unwrap();
+ let res = svc.oneshot(req).await.unwrap();
+ assert_eq!(res.status(), StatusCode::OK);
+ }
+ 
+ fn default_on_failed_upgrade() {
+ fn handler(ws: WebSocketUpgrade) -> Response {
+ ws.on_upgrade(| _ | async { })
+ }
+ 
+ let _ = Router::new().route("/", any(handler));
+ }
+ 
+ fn on_failed_upgrade() {
+ fn handler(ws: WebSocketUpgrade) -> Response {
+ ws.on_failed_upgrade(| _error: Error | println!("oops!")).on_upgrade(| _ | async { })
+ }
+ 
+ let _ = Router::new().route("/", any(handler));
+ }
+ 
+ #[crate::test]
+ fn integration_test() {
+ let addr = spawn_service(echo_app());
+ let uri = format!("ws://{addr}/echo").try_into().unwrap();
+ let req = tungstenite::client::ClientRequestBuilder::new(uri).with_sub_protocol(TEST_ECHO_APP_REQ_SUBPROTO);
+ let _ = tokio_tungstenite::connect_async(req).await.unwrap();
+ test_echo_app(socket, response.headers()).await;
+ }
+ 
+ #[crate::test]
+ #[cfg(feature = "http2")]
+ fn http2() {
+ let addr = spawn_service(echo_app());
+ let io = TokioIo::new(TcpStream::connect(addr).await.unwrap());
+ let _ = hyper::client::conn::http2::Builder::new(TokioExecutor::new()).handshake(io).await.unwrap();
+ for _ in 0 .. 10 { tokio::task::yield_now().await; }
+ assert!(conn.is_extended_connect_protocol_enabled());
+ tokio::spawn(async { conn.await.unwrap(); });
+ let req = Request::builder().method(Method::CONNECT).extension(hyper::ext::Protocol::from_static("websocket")).uri("/echo").header("sec-websocket-version", "13").header("sec-websocket-protocol", TEST_ECHO_APP_REQ_SUBPROTO).header("Host", "server.example.com").body(Body::empty()).unwrap();
+ let mut response = send_request.send_request(req).await.unwrap();
+ let status = response.status();
+ if status != 200 { let body = response.into_body().collect().await.unwrap().to_bytes(); let body = std::str::from_utf8(&body).unwrap(); panic!("response status was {status}: {body}"); }
+ let upgraded = hyper::upgrade::on(&mut response).await.unwrap();
+ let upgraded = TokioIo::new(upgraded);
+ let socket = WebSocketStream::from_raw_socket(upgraded, protocol::Role::Client, None).await;
+ test_echo_app(socket, response.headers()).await;
+ }
+ 
+ fn echo_app() -> Router {
+ fn handle_socket(socket: WebSocket) {
+ assert_eq!(socket.protocol().unwrap(), "echo");
+ while let Some(Ok(msg)) = socket.recv().await { match msg { Message::Text(_) | Message::Binary(_) | Message::Close(_) => { if socket.send(msg).await.is_err() { break; } } Message::Ping(_) | Message::Pong(_) => { } } }
+ }
+ 
+ Router::new().route("/echo", any(| ws: WebSocketUpgrade | { let ws = ws.protocols(["echo2", "echo"]); assert_eq!(ws.selected_protocol().unwrap(), "echo"); ready(ws.on_upgrade(handle_socket)) }) )
+ }
+ 
+ const TEST_ECHO_APP_REQ_SUBPROTO: &str = "echo3, echo";
+ 
+ fn test_echo_app<S: AsyncRead + AsyncWrite + Unpin>(socket: WebSocketStream<S>, headers: &http::HeaderMap) {
+ assert_eq!(headers [http::header::SEC_WEBSOCKET_PROTOCOL], "echo");
+ let input = tungstenite::Message::Text(tungstenite::Utf8Bytes::from_static("foobar"));
+ socket.send(input.clone()).await.unwrap();
+ let output = socket.next().await.unwrap().unwrap();
+ assert_eq!(input, output);
+ socket.send(tungstenite::Message::Ping(Bytes::from_static(b"ping"))).await.unwrap();
+ let output = socket.next().await.unwrap().unwrap();
+ assert_eq!(output, tungstenite::Message::Pong(Bytes::from_static(b"ping")));
+ }
+ 
+}
+

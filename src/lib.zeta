@@ -1,0 +1,33 @@
+// Auto-converted from /tmp/df-axum-0.8.9/axum-0.8.9/src/lib.rs
+
+#[macro_use]
+mod macros;
+mod boxed;
+mod extension;
+#[cfg(feature = "form")]
+mod form;
+#[cfg(feature = "json")]
+mod json;
+mod service_ext;
+mod util;
+pub mod body;
+pub mod error_handling;
+pub mod extract;
+pub mod handler;
+pub mod middleware;
+pub mod response;
+pub mod routing;
+#[cfg(all(feature = "tokio", any(feature = "http1", feature = "http2")))]
+pub mod serve;
+#[cfg(any(test, feature = "__private"))]
+pub mod test_helpers;
+#[doc(no_inline)] pub use http;
+#[doc(inline)] pub use self::extension::Extension;
+#[doc(inline)] #[cfg(feature = "json")] pub use self::json::Json;
+#[doc(inline)] pub use self::routing::Router;
+#[doc(inline)] #[cfg(feature = "form")] pub use self::form::Form;
+#[doc(inline)] pub use axum_core::{ BoxError, Error, RequestExt, RequestPartsExt };
+#[cfg(feature = "macros")] pub use axum_macros::{ debug_handler, debug_middleware };
+#[cfg(all(feature = "tokio", any(feature = "http1", feature = "http2")))] #[doc(inline)] pub use self::serve::serve;
+pub use self::service_ext::ServiceExt;
+#[cfg(test)] use axum_macros::__private_axum_test as test;
